@@ -193,8 +193,8 @@ Because of that, `GroupedMoECached` should be interpreted mainly as:
 - an **ablation** that isolates the cost of online routing-plan construction, or
 - an **optimistic upper bound** for cases where routing metadata can be reused
 
+A second important observation is that the benefit of grouped dispatch shrinks as expert FFN compute becomes more dominant. In larger-compute regimes, all implementations spend more of their time in the expert FFNs themselves, so the relative benefit of improved routing organization decreases. However, we did not test this explicitly, the results assume fixed size FFN and token states. 
 
-A second important observation is that the benefit of grouped dispatch shrinks as expert FFN compute becomes more dominant. In larger-compute regimes, all implementations spend more of their time in the expert FFNs themselves, so the relative benefit of improved routing organization decreases. However, we did not test this explicitly, the results assume fixed size FFN and token states. S
 ---
 
 ## What this project demonstrates
