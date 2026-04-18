@@ -40,30 +40,18 @@ class NaiveMoE(nn.Module):
         ])
 
     def forward(self, x: torch.Tensor, expert_indices: torch.Tensor) -> torch.Tensor:
-        """
-        x: [num_tokens, hidden_dim]
-        expert_indices: [num_tokens] (1D tensor of ints mapping token -> expert)
-        """
-        # Allocate an empty output tensor in VRAM (our scatter destination)
-        output = torch.zeros_like(x)
-        #Naive batching -
-        for i, expert in enumerate(self.experts):
-            # 1. Find the 1D indices of tokens assigned to expert i
-            token_idx = (expert_indices == i).nonzero(as_tuple=True)[0]
-            
-            # 2. Check if this expert got any tokens (skip if empty)
-            if token_idx.numel() == 0:
-                continue
-                
-            # 3. GATHER (The Bottleneck): Pull scattered tokens into a contiguous block
-            expert_input = x[token_idx]
-            
-            # 4. COMPUTE: Fast dense matrix multiplication
-            expert_output = expert(expert_input)
-            
-            # 5. SCATTER (The Bottleneck): Write scattered tokens back to output
-            output[token_idx] = expert_output
-            
+        output = torch.empty_like(x)
+
+        with torch.cuda.nvtx.range("naive.expert_loop"):
+            for i, expert in enumerate(self.experts):
+                token_idx = (expert_indices == i).nonzero(as_tuple=True)[0]
+                if token_idx.numel() == 0:
+                    continue
+
+                expert_input = x[token_idx]
+                expert_output = expert(expert_input)
+                output[token_idx] = expert_output
+
         return output
 
 class GroupedMoE(nn.Module):
@@ -75,75 +63,92 @@ class GroupedMoE(nn.Module):
         ])
 
     def forward(self, x: torch.Tensor, expert_indices: torch.Tensor) -> torch.Tensor:
-        # STEP 1: Sort the indices to group tokens by expert
-        # sorted_expert_indices: e.g., [0, 0, 1, 1, 1, 2, ...]
-        # sort_order: the original row numbers, used so we can unsort later
-        sorted_expert_indices, sort_order = torch.sort(expert_indices)
-        
-        # STEP 2: Rearrange the input tensor ONCE (One coalesced gather)
-        grouped_x = x[sort_order]
-        
-        # Allocate output tensor for the grouped results
-        grouped_output = torch.zeros_like(grouped_x)
-        
-        # STEP 3: Count how many tokens belong to each expert
-        # bincount returns an array of counts: e.g., [2, 3, 1] means Expert 0 got 2 tokens.
-        # .cpu().tolist() moves it to standard Python integers so we can loop over it safely.
-        tokens_per_expert = torch.bincount(sorted_expert_indices, minlength=self.num_experts).cpu().tolist()
-        
-        # STEP 4: Process sequentially using slices (Zero-copy!)
+        with torch.cuda.nvtx.range("grouped.sort"):
+            sorted_expert_indices, sort_order = torch.sort(expert_indices)
+
+        with torch.cuda.nvtx.range("grouped.reorder_input"):
+            grouped_x = x[sort_order]
+
+        grouped_output = torch.empty_like(grouped_x)
+
+        with torch.cuda.nvtx.range("grouped.counts_to_cpu"):
+            tokens_per_expert = torch.bincount(
+                sorted_expert_indices, minlength=self.num_experts
+            ).cpu().tolist()
+
         current_idx = 0
-        for i, num_tokens in enumerate(tokens_per_expert):
-            if num_tokens == 0:
-                continue
-                
-            # SLICE: This does not copy memory, it just offsets a C++ pointer
-            expert_input = grouped_x[current_idx : current_idx + num_tokens]
-            
-            # COMPUTE
-            expert_output = self.experts[i](expert_input)
-            
-            # SLICE WRITE
-            grouped_output[current_idx : current_idx + num_tokens] = expert_output
-            
-            current_idx += num_tokens
-            
-        # STEP 5: Restore original order (One coalesced scatter)
-        # We use the sort_order array as the index destination
-        output = torch.empty_like(grouped_output)
-        output[sort_order] = grouped_output
-        
+        with torch.cuda.nvtx.range("grouped.expert_loop"):
+            for i, num_tokens in enumerate(tokens_per_expert):
+                if num_tokens == 0:
+                    continue
+                expert_input = grouped_x[current_idx: current_idx + num_tokens]
+                expert_output = self.experts[i](expert_input)
+                grouped_output[current_idx: current_idx + num_tokens] = expert_output
+                current_idx += num_tokens
+
+        with torch.cuda.nvtx.range("grouped.restore_output"):
+            output = torch.empty_like(grouped_output)
+            output[sort_order] = grouped_output
+
         return output
+def build_group_plan(expert_indices: torch.Tensor, num_experts: int):
+    with torch.cuda.nvtx.range("group_plan.sort"):
+        sorted_experts, sort_order = torch.sort(expert_indices)
 
-if __name__ == "__main__":
-    hidden_dim = 512
-    ffn_dim = 2048
-    num_tokens = 128
-    num_experts = 4
+    with torch.cuda.nvtx.range("group_plan.bincount"):
+        counts = torch.bincount(sorted_experts, minlength=num_experts)
 
-    # 1. Instantiate both models
-    moe_naive = NaiveMoE(hidden_dim, ffn_dim, num_experts).cuda()
-    moe_grouped = GroupedMoE(hidden_dim, ffn_dim, num_experts).cuda()
+    with torch.cuda.nvtx.range("group_plan.offsets"):
+        offsets = torch.zeros(
+            num_experts + 1,
+            device=expert_indices.device,
+            dtype=torch.long
+        )
+        offsets[1:] = counts.cumsum(0)
 
-    # CRITICAL: Copy the random weights from Naive to Grouped so they are mathematically identical
-    moe_grouped.load_state_dict(moe_naive.state_dict())
+    with torch.cuda.nvtx.range("group_plan.restore_order"):
+        restore_order = torch.empty_like(sort_order)
+        restore_order[sort_order] = torch.arange(
+            sort_order.numel(), device=expert_indices.device
+        )
 
-    # 2. Create data
-    x = torch.randn(num_tokens, hidden_dim).cuda()
-    expert_indices = torch.randint(0, num_experts, (num_tokens,)).cuda()
+    with torch.cuda.nvtx.range("group_plan.to_cpu"):
+        offsets_cpu = offsets.cpu().tolist()
 
-    # 3. Run both
-    out_naive = moe_naive(x, expert_indices)
-    out_grouped = moe_grouped(x, expert_indices)
+    return {
+        "sort_order": sort_order,
+        "restore_order": restore_order,
+        "offsets_cpu": offsets_cpu,
+    }
 
-    # 4. Verify Correctness
-    # torch.allclose checks if two floating-point tensors are equal within a tiny margin of error
-    is_correct = torch.allclose(out_naive, out_grouped, atol=1e-5)
-    
-    print(f"Naive Output Shape: {out_naive.shape}")
-    print(f"Grouped Output Shape: {out_grouped.shape}")
-    
-    if is_correct:
-        print("SUCCESS: GroupedMoE and NaiveMoE produce mathematically identical outputs!")
-    else:
-        print("ERROR: Outputs do not match. We broke the math.")
+
+class GroupedMoECached(nn.Module):
+    def __init__(self, hidden_dim: int, ffn_dim: int, num_experts: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts = nn.ModuleList([
+            Expert(hidden_dim, ffn_dim) for _ in range(num_experts)
+        ])
+
+    def forward(self, x: torch.Tensor, plan) -> torch.Tensor:
+        sort_order = plan["sort_order"]
+        restore_order = plan["restore_order"]
+        offsets = plan["offsets_cpu"]
+
+        with torch.cuda.nvtx.range("grouped_cached.reorder_input"):
+            grouped_x = x[sort_order]
+
+        grouped_output = torch.empty_like(grouped_x)
+
+        with torch.cuda.nvtx.range("grouped_cached.expert_loop"):
+            for i in range(self.num_experts):
+                start = offsets[i]
+                end = offsets[i + 1]
+                if start == end:
+                    continue
+
+                expert_input = grouped_x[start:end]
+                grouped_output[start:end] = self.experts[i](expert_input)
+
+        with torch.cuda.nvtx.range("grouped_cached.restore_output"):
+            return grouped_output[restore_order]
